@@ -1,0 +1,20 @@
+{
+  "nodes": {
+    "extract_functions": { "func": "extract_functions" },
+    "check_complexity": { "func": "check_complexity" },
+    "detect_issues": { "func": "detect_issues" },
+    "suggest_improvements": { "func": "suggest_improvements" },
+    "end_node": { "func": "end_node" }
+  },
+  "edges": {
+    "extract_functions": ["check_complexity"],
+    "check_complexity": ["detect_issues"],
+    "detect_issues": ["suggest_improvements"],
+    "suggest_improvements": ["suggest_improvements", "end_node"]
+  },
+  "conditions": {
+    "suggest_improvements->end_node": "state['quality_score'] >= 0.5",
+    "suggest_improvements->suggest_improvements": "state['quality_score'] < 0.5 and state.get('iterations', 0) < 5"
+  },
+  "start_node": "extract_functions"
+}

@@ -1,0 +1,6 @@
+{
+  "graph_id": "d80b1f88-6381-4050-8792-64fa323290f2",
+  "initial_state": {
+    "code": "def hello(name):\n    # TODO: add more functionality\n    print(f\"Hello, {name}!\")\n\ndef complex_function(a, b, c, d, e, f, g):\n    if a > 0 and b > 0:\n        for i in range(a):\n            while i < b:\n                if c or d:\n                    print(f\"Very long line that exceeds 100 characters limit and is intentionally written to trigger the long line detection {c}\")\n                i += 1\n    return a + b\n\ndef bad_function(x, y, z, w, p, q, r):\n    # This function has too many parameters\n    # and a missing docstring\n    return x + y\n"
+  }
+}

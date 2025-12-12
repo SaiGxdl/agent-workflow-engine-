@@ -1,0 +1,11 @@
+# Core dependencies for Agent Workflow Engine
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+pydantic>=2.0.0
+pytest>=7.0.0
+
+# Optional development tools
+# Uncomment below if needed:
+# black>=23.0.0
+# flake8>=6.0.0
+# pytest-cov>=4.0.0

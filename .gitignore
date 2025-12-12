@@ -1,0 +1,25 @@
+
+# Virtual env
+.venv/
+venv/
+env/
+ENV/
+
+# Python caches
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# SQLite DB
+runs.db
+
+# Editor / OS files
+.vscode/
+*.swp
+.DS_Store
+
+# Node/npm (if any)
+node_modules/
+package-lock.json
