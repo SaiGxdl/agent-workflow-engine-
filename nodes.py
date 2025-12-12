@@ -7,9 +7,8 @@ from tools import TOOLS  # ensure this module exists and exposes required helper
 def extract_functions(state: Dict[str, Any]) -> Dict[str, Any]:
     """
     Robustly extract function definitions from state['code'].
-    - Prefer AST parsing (FunctionDef / AsyncFunctionDef).
-    - If AST finds nothing, fall back to a simple regex to detect `def name(` lines.
-    - Return state with 'functions' list of dicts: {name, source, line_start}.
+    Prefer AST-based extraction; if nothing found, fall back to regex.
+    Returns state with 'functions': List[{name, source, line_start}]
     """
     import re
 
@@ -20,13 +19,14 @@ def extract_functions(state: Dict[str, Any]) -> Dict[str, Any]:
         state["functions"] = functions
         return state
 
-    # 1) Try AST-based extraction
+    # 1) Try AST-based extraction (function + async function)
     try:
         tree = ast.parse(code)
         for node in ast.walk(tree):
-            if isinstance(node, (ast.FunctionDef, getattr(ast, "AsyncFunctionDef", type(None)))):
+            # Include FunctionDef and AsyncFunctionDef (if available)
+            async_cls = getattr(ast, "AsyncFunctionDef", None)
+            if isinstance(node, ast.FunctionDef) or (async_cls is not None and isinstance(node, async_cls)):
                 # try to get source segment if possible
-                source = ""
                 try:
                     source = ast.get_source_segment(code, node) or ""
                 except Exception:
@@ -44,12 +44,11 @@ def extract_functions(state: Dict[str, Any]) -> Dict[str, Any]:
                     "line_start": getattr(node, "lineno", None),
                 })
     except Exception:
-        # If AST parsing fails unexpectedly, continue to regex fallback below
+        # fallback to regex if AST fails
         functions = []
 
     # 2) Regex fallback if AST found nothing
     if not functions:
-        # simple regex to find "def <name>(...):"
         pattern = re.compile(r'^\s*def\s+([A-Za-z_]\w*)\s*\(', re.MULTILINE)
         matches = list(pattern.finditer(code))
         if matches:
@@ -59,6 +58,7 @@ def extract_functions(state: Dict[str, Any]) -> Dict[str, Any]:
                 start_pos = m.start()
                 line_no = code.count("\n", 0, start_pos) + 1
                 src_lines = []
+                # capture until blank line or end (simple heuristic)
                 for i in range(line_no - 1, len(lines)):
                     src_lines.append(lines[i])
                     if lines[i].strip() == "":
@@ -74,16 +74,13 @@ def extract_functions(state: Dict[str, Any]) -> Dict[str, Any]:
     return state
 
 
-
-
-
-
 def check_complexity(state: Dict[str, Any]) -> Dict[str, Any]:
-    """Compute complexity score for each function."""
-    functions = state.get("functions", [])
+    """Compute complexity score for each function using TOOLS['count_control_flow']."""
+    functions = state.get("functions", []) or []
 
     for func in functions:
-        count = 1 + TOOLS["count_control_flow"](func.get("source", ""))
+        src = func.get("source", "") or ""
+        count = 1 + TOOLS["count_control_flow"](src)
         func["complexity_score"] = count
 
     return state
@@ -91,29 +88,24 @@ def check_complexity(state: Dict[str, Any]) -> Dict[str, Any]:
 
 def detect_issues(state: Dict[str, Any]) -> Dict[str, Any]:
     """Detect code issues: long lines, TODOs, missing docstrings, too many params."""
-    functions = state.get("functions", [])
+    functions = state.get("functions", []) or []
     issues = []
 
     for func in functions:
         func_issues = []
+        src = func.get("source", "") or ""
 
-        src = func.get("source", "")
-
-        # Long lines
         long_lines = TOOLS["detect_long_lines"](src, 100)
         if long_lines:
             func_issues.append(f"Long lines: {long_lines}")
 
-        # TODOs
         todos = TOOLS["detect_todos"](src)
         if todos:
             func_issues.append(f"TODO comments: {todos}")
 
-        # Missing docstring
         if TOOLS["detect_missing_docstrings"](src):
             func_issues.append("Missing docstring")
 
-        # Too many parameters
         params = TOOLS["count_parameters"](src)
         if params > 5:
             func_issues.append(f"Too many parameters: {params}")
@@ -127,7 +119,7 @@ def detect_issues(state: Dict[str, Any]) -> Dict[str, Any]:
 
 def suggest_improvements(state: Dict[str, Any]) -> Dict[str, Any]:
     """Generate suggestions and compute quality score."""
-    functions = state.get("functions", [])
+    functions = state.get("functions", []) or []
     suggestions = []
     total_issues = len(state.get("issues", []))
 

@@ -2,14 +2,13 @@
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
 from fastapi.responses import HTMLResponse
 from datetime import datetime, timezone
-from typing import Any
 import uuid
 import asyncio
 import os
 import logging
+from typing import Any, Dict, List
 
 from models import (
-    CreateGraphRequest,
     CreateGraphResponse,
     RunGraphRequest,
     RunGraphResponse,
@@ -17,10 +16,10 @@ from models import (
     RunState,
 )
 
-# Use SQLite for both graphs and runs
+# Storage backend (ensure storage_sqlite implements required API)
 from storage_sqlite import SQLiteStorage
 
-# Node and engine imports
+# Node functions and engine
 from engine import WorkflowEngine
 from nodes import (
     extract_functions,
@@ -46,14 +45,9 @@ app = FastAPI(title="Agent Workflow Engine", version="0.1.0")
 # -----------------------------
 # Storage Setup (SQLite for both graphs and runs)
 # -----------------------------
-storage_graphs = SQLiteStorage()
-storage_runs = SQLiteStorage()
-
-# Optional override: store graphs somewhere else via env var later if needed
-USE_SQLITE_FOR_GRAPHS = os.getenv("USE_SQLITE_FOR_GRAPHS", "1") == "1"
-if not USE_SQLITE_FOR_GRAPHS:
-    # If you later implement a separate graph store, you can override here.
-    pass
+# If you want an in-memory store for debugging, replace these with an InMemoryStorage instance.
+storage_graphs: SQLiteStorage = SQLiteStorage()
+storage_runs: SQLiteStorage = SQLiteStorage()
 
 # -----------------------------
 # Node registry and engine init
@@ -67,6 +61,7 @@ NODE_FUNCTIONS = {
 }
 
 engine = WorkflowEngine(NODE_FUNCTIONS)
+
 
 # -----------------------------
 # Routes
@@ -87,16 +82,14 @@ def health():
 @app.post("/graph/create", response_model=CreateGraphResponse)
 async def create_graph(request: Request):
     """
-    Robust create_graph:
-      - Accepts raw JSON payload (so we can normalize before Pydantic)
-      - Normalizes types/keys: nodes, edges, conditions, start_node
-      - Ensures start_node exists (auto-create if needed)
-      - Ensures each node is a dict and has minimal required keys:
-          - 'func' (defaults to node name)
-          - 'type' (defaults to 'task')
-          - 'params' (defaults to {})
-      - Ensures edges are lists and reference existing nodes (auto-create minimal nodes if needed)
-      - Attempts to construct GraphDefinitionModel and store it; returns helpful error if still fails
+    Accept a flexible graph payload, normalize it, validate with Pydantic, and store.
+    Expected incoming shape:
+    {
+      "nodes": { "<name>": {"func": "func_name", ...}, ... },
+      "edges": { "<name>": ["target1", "target2"], ... },
+      "conditions": { "src->dst": "condition", ... },
+      "start_node": "<name>"
+    }
     """
     try:
         payload = await request.json()
@@ -104,13 +97,13 @@ async def create_graph(request: Request):
         logger.exception("Invalid JSON payload in create_graph")
         raise HTTPException(status_code=400, detail="Invalid JSON payload")
 
-    # Normalize base keys
+    # Basic normalization / defaults
     nodes = payload.get("nodes") or {}
     edges = payload.get("edges") or {}
     conditions = payload.get("conditions") or {}
     start_node = payload.get("start_node")
 
-    # Sanity type checks
+    # Basic type checks - return 400 for bad shapes
     if not isinstance(nodes, dict):
         raise HTTPException(status_code=400, detail="`nodes` must be an object/dictionary")
     if not isinstance(edges, dict):
@@ -118,7 +111,7 @@ async def create_graph(request: Request):
     if not isinstance(conditions, dict):
         raise HTTPException(status_code=400, detail="`conditions` must be an object/dictionary")
 
-    # Ensure start_node exists; choose fallback if missing
+    # Ensure start_node exists
     if not start_node:
         if nodes:
             start_node = next(iter(nodes.keys()))
@@ -128,72 +121,55 @@ async def create_graph(request: Request):
             nodes[start_node] = {}
             logger.info("No nodes provided; created default start node: %s", start_node)
 
-    # If start_node not in nodes, create a minimal node for it
     if start_node not in nodes:
         nodes[start_node] = {}
         logger.info("start_node '%s' was not present in nodes; created an empty node.", start_node)
 
-    # Normalize and auto-fill each node
+    # Normalize nodes: ensure dict and default func
     for name, nodeval in list(nodes.items()):
-        # Normalize non-dict node representations to dict
         if nodeval is None or not isinstance(nodeval, dict):
             nodes[name] = {}
             nodeval = nodes[name]
-
-        # Ensure minimal required keys exist & have reasonable default types
-        # func: required by your models (default to node name)
-        if "func" not in nodeval or nodeval.get("func") in (None, ""):
+        if "func" not in nodeval or not isinstance(nodeval.get("func"), str) or nodeval.get("func") == "":
             nodes[name]["func"] = name
 
-        # type: default to "task" if missing or not a string
-        if "type" not in nodeval or not isinstance(nodeval.get("type"), str):
-            nodes[name]["type"] = "task"
-
-        # params: default to empty dict
-        if "params" not in nodeval or not isinstance(nodeval.get("params"), dict):
-            nodes[name]["params"] = {}
-
-    # Validate & normalize edges: ensure target nodes exist; edges must be list
+    # Validate edges and auto-create referenced nodes if missing
     for src, out_edges in list(edges.items()):
         if src not in nodes:
-            # forgive referencing unknown node by making a minimal node
-            nodes[src] = {"func": src, "type": "task", "params": {}}
+            nodes[src] = {"func": src}
             logger.warning("Auto-created node '%s' referenced in edges.", src)
 
-        # edges must be list
         if out_edges is None:
             edges[src] = []
             out_edges = edges[src]
         if not isinstance(out_edges, list):
             raise HTTPException(status_code=400, detail=f"Edges for node '{src}' must be a list")
 
-        # ensure each referenced edge target exists (auto-create minimal node if needed)
         for tgt in out_edges:
             if not isinstance(tgt, str):
                 raise HTTPException(status_code=400, detail=f"Edge targets must be string node names (bad target on '{src}')")
             if tgt not in nodes:
-                nodes[tgt] = {"func": tgt, "type": "task", "params": {}}
+                nodes[tgt] = {"func": tgt}
                 logger.warning("Auto-created node '%s' referenced as an edge target.", tgt)
 
-    # Now construct typed GraphDefinitionModel and store it
+    # Build minimal nodes dict for Pydantic model (avoid extra-key validation issues)
     try:
+        minimal_nodes: Dict[str, Dict[str, str]] = {n: {"func": nodes[n]["func"]} for n in nodes}
         graph = GraphDefinitionModel(
-            nodes=nodes,
+            nodes=minimal_nodes,
             edges=edges,
             conditions=conditions,
             start_node=start_node,
         )
     except Exception as e:
-        # Validation failed despite normalization: return user-friendly message
         logger.exception("GraphDefinitionModel validation failed in create_graph")
         raise HTTPException(status_code=400, detail=f"Graph schema validation failed: {str(e)}")
 
-    # Store graph
+    # Persist graph (offload to thread if storage may block)
     try:
-        graph_id = storage_graphs.store_graph(graph)
+        graph_id = await asyncio.to_thread(storage_graphs.store_graph, graph)
     except Exception as e:
         logger.exception("Failed to store graph in create_graph")
-        # storage failure is server-side — return 500 with a clear message
         raise HTTPException(status_code=500, detail=f"Failed to store graph: {str(e)}")
 
     return CreateGraphResponse(graph_id=graph_id)
@@ -201,8 +177,8 @@ async def create_graph(request: Request):
 
 @app.post("/graph/run", response_model=RunGraphResponse)
 async def run_graph(request: RunGraphRequest):
-    """Run a graph synchronously."""
-    graph = storage_graphs.get_graph(request.graph_id)
+    """Run a workflow graph synchronously and return final state + log."""
+    graph = await asyncio.to_thread(storage_graphs.get_graph, request.graph_id)
     if not graph:
         raise HTTPException(status_code=404, detail="Graph not found")
 
@@ -223,12 +199,27 @@ async def run_graph(request: RunGraphRequest):
         completed_at=datetime.now(timezone.utc),
     )
 
-    await asyncio.to_thread(storage_runs.store_run, run)
+    try:
+        await asyncio.to_thread(storage_runs.store_run, run)
+    except Exception as e:
+        logger.exception("Failed to store run")
+        raise HTTPException(status_code=500, detail=f"Failed to store run: {e}")
 
-    return RunGraphResponse(run_id=run.run_id, final_state=final_state, log=log)
+    # Convert log entries to pydantic-friendly form if they are dataclasses
+    try:
+        pydantic_log = []
+        for entry in log:
+            if hasattr(entry, "to_pydantic"):
+                pydantic_log.append(entry.to_pydantic())
+            else:
+                pydantic_log.append(entry)
+    except Exception:
+        pydantic_log = log
+
+    return RunGraphResponse(run_id=run.run_id, final_state=final_state, log=pydantic_log)
 
 
-async def _execute_and_store(graph, initial_state, run_id: str):
+async def _execute_and_store(graph: Any, initial_state: dict, run_id: str):
     """Background executor for async runs."""
     try:
         logger.info("Background run started: %s", run_id)
@@ -259,14 +250,20 @@ async def _execute_and_store(graph, initial_state, run_id: str):
 @app.post("/graph/run-async")
 async def run_graph_async(request: RunGraphRequest, bg: BackgroundTasks):
     """Start async run and return immediately with run_id."""
-    graph = storage_graphs.get_graph(request.graph_id)
+    graph = await asyncio.to_thread(storage_graphs.get_graph, request.graph_id)
     if not graph:
         raise HTTPException(status_code=404, detail="Graph not found")
 
     run_id = str(uuid.uuid4())
 
-    storage_runs.reserve_run(run_id, request.graph_id, request.initial_state)
+    # Reserve run in storage (offload to thread)
+    try:
+        await asyncio.to_thread(storage_runs.reserve_run, run_id, request.graph_id, request.initial_state)
+    except Exception as e:
+        logger.exception("Failed to reserve run")
+        raise HTTPException(status_code=500, detail=f"Failed to reserve run: {e}")
 
+    # Schedule background task (BackgroundTasks will run after response)
     bg.add_task(_execute_and_store, graph, request.initial_state, run_id)
 
     return {"run_id": run_id, "status": "started"}
@@ -274,11 +271,23 @@ async def run_graph_async(request: RunGraphRequest, bg: BackgroundTasks):
 
 @app.get("/graph/state/{run_id}")
 def get_run_state(run_id: str):
-    """Return run state from storage (dict)."""
+    """Return run state from storage (prefer pydantic serialization if available)."""
     run = storage_runs.get_run(run_id)
     if not run:
         raise HTTPException(status_code=404, detail="Run not found")
-    return run
+
+    try:
+        if hasattr(run, "to_pydantic"):
+            return run.to_pydantic()
+        if hasattr(run, "dict"):
+            return run.dict()
+        return run
+    except Exception:
+        logger.exception("Failed to serialize run for run_id=%s", run_id)
+        return {
+            "run_id": getattr(run, "run_id", run_id),
+            "status": getattr(run, "status", "unknown"),
+        }
 
 
 if __name__ == "__main__":
